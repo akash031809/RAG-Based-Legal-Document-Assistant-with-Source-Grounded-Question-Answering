@@ -1,14 +1,31 @@
 import os
+import sys
 import requests
 import streamlit as nn
 from dotenv import load_dotenv
+from pathlib import Path
+
+# Add root folder to sys.path to allow importing backend module in Streamlit Cloud or direct runs
+current_file = Path(__file__).resolve()
+project_root = current_file.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
 # Load env variables
 load_dotenv()
 
-BACKEND_HOST = os.getenv("BACKEND_HOST", "127.0.0.1")
-BACKEND_PORT = os.getenv("BACKEND_PORT", "8000")
-BACKEND_URL = f"http://{BACKEND_HOST}:{BACKEND_PORT}"
+# On Streamlit Cloud, load secrets from st.secrets (overrides .env)
+try:
+    if hasattr(nn, "secrets") and "OPENAI_API_KEY" in nn.secrets:
+        os.environ["OPENAI_API_KEY"] = nn.secrets["OPENAI_API_KEY"]
+except Exception:
+    pass
+
+BACKEND_URL = os.getenv("BACKEND_URL")
+if not BACKEND_URL:
+    BACKEND_HOST = os.getenv("BACKEND_HOST", "127.0.0.1")
+    BACKEND_PORT = os.getenv("BACKEND_PORT", "8000")
+    BACKEND_URL = f"http://{BACKEND_HOST}:{BACKEND_PORT}"
 
 # Streamlit App Config
 nn.set_page_config(
@@ -117,26 +134,65 @@ if "sources" not in nn.session_state:
 if "selected_sources" not in nn.session_state:
     nn.session_state.selected_sources = []
 
+# Try importing RAG engine for direct local fallback
+try:
+    from backend.rag_engine import (
+        query_rag,
+        build_or_update_vector_store,
+        DOCUMENTS_DIR,
+        VECTOR_STORE_DIR
+    )
+    import shutil
+    DIRECT_RAG_AVAILABLE = True
+except ImportError:
+    DIRECT_RAG_AVAILABLE = False
+
 # Verify backend health
 backend_active = check_backend_connection()
+use_direct_mode = not backend_active and DIRECT_RAG_AVAILABLE
 
-if not backend_active:
+if not backend_active and not DIRECT_RAG_AVAILABLE:
     nn.error(f"⚠️ **Connection Error**: Cannot connect to the FastAPI backend at `{BACKEND_URL}`.")
     nn.info("Please start the backend server using the following command in your terminal:\n```bash\nuvicorn backend.main:app --reload --port 8000\n```")
     nn.stop()
 
 # Load documents list
 def fetch_documents():
-    try:
-        res = requests.get(f"{BACKEND_URL}/documents")
-        if res.status_code == 200:
-            return res.json()
-    except Exception as e:
-        nn.sidebar.error(f"Error fetching docs: {e}")
-    return []
+    if use_direct_mode:
+        if not os.path.exists(DOCUMENTS_DIR):
+            return []
+        documents = []
+        for filename in os.listdir(DOCUMENTS_DIR):
+            if filename.lower().endswith(".pdf"):
+                file_path = os.path.join(DOCUMENTS_DIR, filename)
+                try:
+                    stat_info = os.stat(file_path)
+                    documents.append({
+                        "filename": filename,
+                        "size_bytes": stat_info.st_size,
+                        "path": file_path
+                    })
+                except Exception:
+                    pass
+        return documents
+    else:
+        try:
+            res = requests.get(f"{BACKEND_URL}/documents")
+            if res.status_code == 200:
+                return res.json()
+        except Exception as e:
+            nn.sidebar.error(f"Error fetching docs: {e}")
+        return []
 
 # Sidebar Configuration
 nn.sidebar.markdown("<h2 style='text-align: center; color: #C180FF; font-family: Playfair Display;'>⚙️ Configuration</h2>", unsafe_allow_html=True)
+
+if use_direct_mode:
+    nn.sidebar.success("⚡ Running in Local Direct Mode")
+    nn.sidebar.caption("All parsing, embedding, and QA are running directly within the Streamlit process (no backend service needed).")
+else:
+    nn.sidebar.success("🔌 Connected to FastAPI Backend")
+    nn.sidebar.caption(f"Connected to backend API at: {BACKEND_URL}")
 
 # 1. LLM Settings
 nn.sidebar.subheader("LLM Provider")
@@ -188,22 +244,42 @@ if uploaded_docs:
         col_name.markdown(f"📄 **{doc['filename']}**<br><span style='font-size:0.8em;color:#8892B0;'>{size_kb:.1f} KB</span>", unsafe_allow_html=True)
         if col_del.button("🗑️", key=f"del_{doc['filename']}"):
             try:
-                res = requests.delete(f"{BACKEND_URL}/documents/{doc['filename']}")
-                if res.status_code == 200:
+                if use_direct_mode:
+                    file_path = os.path.join(DOCUMENTS_DIR, doc['filename'])
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    build_or_update_vector_store()
                     nn.toast(f"Deleted {doc['filename']}")
                     nn.rerun()
                 else:
-                    nn.sidebar.error("Failed to delete.")
+                    res = requests.delete(f"{BACKEND_URL}/documents/{doc['filename']}")
+                    if res.status_code == 200:
+                        nn.toast(f"Deleted {doc['filename']}")
+                        nn.rerun()
+                    else:
+                        nn.sidebar.error("Failed to delete.")
             except Exception as e:
                 nn.sidebar.error(f"Error: {e}")
                 
     nn.sidebar.markdown("<br>", unsafe_allow_html=True)
     if nn.sidebar.button("Wipe Database 🚨", use_container_width=True):
         try:
-            res = requests.post(f"{BACKEND_URL}/clear")
-            if res.status_code == 200:
+            if use_direct_mode:
+                if os.path.exists(DOCUMENTS_DIR):
+                    for file in os.listdir(DOCUMENTS_DIR):
+                        file_path = os.path.join(DOCUMENTS_DIR, file)
+                        if os.path.isfile(file_path):
+                            os.remove(file_path)
+                if os.path.exists(VECTOR_STORE_DIR):
+                    shutil.rmtree(VECTOR_STORE_DIR)
+                    os.makedirs(VECTOR_STORE_DIR)
                 nn.toast("Database wiped successfully!")
                 nn.rerun()
+            else:
+                res = requests.post(f"{BACKEND_URL}/clear")
+                if res.status_code == 200:
+                    nn.toast("Database wiped successfully!")
+                    nn.rerun()
         except Exception as e:
             nn.sidebar.error(f"Error clearing: {e}")
 else:
@@ -227,19 +303,28 @@ with nn.expander("📤 Upload Legal Documents", expanded=not uploaded_docs):
             nn.warning("Please select at least one PDF file first.")
         else:
             with nn.spinner("Extracting, chunking, and embedding PDFs locally using Sentence Transformers..."):
-                files_payload = []
-                for f in uploaded_files:
-                    files_payload.append(("files", (f.name, f.read(), "application/pdf")))
-                
                 try:
-                    res = requests.post(f"{BACKEND_URL}/upload", files=files_payload)
-                    if res.status_code == 200:
-                        nn.success(res.json().get("message", "Ingested successfully."))
+                    if use_direct_mode:
+                        os.makedirs(DOCUMENTS_DIR, exist_ok=True)
+                        for f in uploaded_files:
+                            file_path = os.path.join(DOCUMENTS_DIR, f.name)
+                            with open(file_path, "wb") as buffer:
+                                buffer.write(f.getbuffer())
+                        build_or_update_vector_store()
+                        nn.success(f"Successfully uploaded and indexed {len(uploaded_files)} document(s) locally.")
                         nn.rerun()
                     else:
-                        nn.error(f"Upload failed: {res.text}")
+                        files_payload = []
+                        for f in uploaded_files:
+                            files_payload.append(("files", (f.name, f.read(), "application/pdf")))
+                        res = requests.post(f"{BACKEND_URL}/upload", files=files_payload)
+                        if res.status_code == 200:
+                            nn.success(res.json().get("message", "Ingested successfully."))
+                            nn.rerun()
+                        else:
+                            nn.error(f"Upload failed: {res.text}")
                 except Exception as e:
-                    nn.error(f"Error connecting to backend: {e}")
+                    nn.error(f"Error: {e}")
 
 # Layout Columns for Q&A and Source Inspector
 col_qa, col_sources = nn.columns([5, 3])
@@ -273,11 +358,17 @@ with col_qa:
         with nn.chat_message("assistant"):
             with nn.spinner("Analyzing document context and generating source-grounded answer..."):
                 try:
-                    res = requests.post(f"{BACKEND_URL}/query", json=query_data)
-                    if res.status_code == 200:
-                        res_json = res.json()
-                        answer = res_json["answer"]
-                        sources = res_json["sources"]
+                    if use_direct_mode:
+                        result = query_rag(
+                            query=user_query,
+                            llm_provider=llm_provider,
+                            model_name=model_name,
+                            api_key=openai_api_key,
+                            top_k=top_k,
+                            temperature=temperature
+                        )
+                        answer = result["answer"]
+                        sources = result["sources"]
                         
                         # Display answer
                         nn.write(answer)
@@ -287,10 +378,24 @@ with col_qa:
                         nn.session_state.selected_sources = sources
                         nn.rerun()
                     else:
-                        error_detail = res.json().get("detail", res.text)
-                        nn.error(f"Error querying backend: {error_detail}")
+                        res = requests.post(f"{BACKEND_URL}/query", json=query_data)
+                        if res.status_code == 200:
+                            res_json = res.json()
+                            answer = res_json["answer"]
+                            sources = res_json["sources"]
+                            
+                            # Display answer
+                            nn.write(answer)
+                            nn.session_state.messages.append({"role": "assistant", "content": answer})
+                            
+                            # Store sources in session state for rendering on the right panel
+                            nn.session_state.selected_sources = sources
+                            nn.rerun()
+                        else:
+                            error_detail = res.json().get("detail", res.text)
+                            nn.error(f"Error querying backend: {error_detail}")
                 except Exception as e:
-                    nn.error(f"Could not reach backend API: {e}")
+                    nn.error(f"Error processing query: {e}")
 
 # Sources Inspector (Right side panel)
 with col_sources:

@@ -1,0 +1,23 @@
+# Environment
+.env
+.venv/
+venv/
+
+# Streamlit secrets (DO NOT commit real secrets)
+.streamlit/secrets.toml
+
+# Data (FAISS index + uploaded PDFs are ephemeral on Streamlit Cloud)
+data/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs
+*.log
+*.txt
+
+# OS
+.DS_Store
+Thumbs.db
